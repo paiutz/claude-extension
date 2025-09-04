@@ -1,0 +1,661 @@
+// ============================================
+// content/content.js - Injected into web pages
+// ============================================
+
+(function() {
+    'use strict';
+
+    // Listen for messages from popup/background
+    chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
+        switch(request.action) {
+            case 'getSelectedText':
+                sendResponse({ selectedText: window.getSelection().toString() });
+                break;
+                
+            case 'getPageContent':
+                sendResponse({
+                    title: document.title,
+                    url: window.location.href,
+                    content: document.body.innerText,
+                    selection: window.getSelection().toString()
+                });
+                break;
+                
+            case 'highlightText':
+                highlightTextOnPage(request.text);
+                break;
+                
+            case 'showFloatingAssistant':
+                showFloatingAssistant(request.text);
+                break;
+        }
+        return true; // Keep message channel open for async response
+    });
+
+    // Create floating assistant UI
+    let floatingAssistant = null;
+
+    function showFloatingAssistant(selectedText = '') {
+        if (floatingAssistant) {
+            floatingAssistant.remove();
+        }
+
+        floatingAssistant = document.createElement('div');
+        floatingAssistant.id = 'claude-floating-assistant';
+        floatingAssistant.innerHTML = `
+            <style>
+                #claude-floating-assistant {
+                    position: fixed;
+                    bottom: 20px;
+                    right: 20px;
+                    width: 350px;
+                    max-height: 500px;
+                    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+                    border-radius: 12px;
+                    box-shadow: 0 10px 40px rgba(0, 0, 0, 0.3);
+                    z-index: 999999;
+                    font-family: -apple-system, sans-serif;
+                    animation: slideIn 0.3s ease;
+                }
+
+                @keyframes slideIn {
+                    from {
+                        transform: translateX(400px);
+                        opacity: 0;
+                    }
+                    to {
+                        transform: translateX(0);
+                        opacity: 1;
+                    }
+                }
+
+                #claude-floating-header {
+                    padding: 12px 16px;
+                    color: white;
+                    display: flex;
+                    justify-content: space-between;
+                    align-items: center;
+                    cursor: move;
+                }
+
+                #claude-floating-content {
+                    background: white;
+                    padding: 16px;
+                    border-radius: 0 0 12px 12px;
+                    max-height: 400px;
+                    overflow-y: auto;
+                }
+
+                #claude-floating-input {
+                    width: 100%;
+                    padding: 10px;
+                    border: 2px solid #e0e0e0;
+                    border-radius: 8px;
+                    font-size: 14px;
+                    margin-bottom: 12px;
+                    resize: vertical;
+                    min-height: 60px;
+                }
+
+                #claude-floating-input:focus {
+                    outline: none;
+                    border-color: #667eea;
+                }
+
+                .claude-quick-actions {
+                    display: flex;
+                    gap: 8px;
+                    flex-wrap: wrap;
+                    margin-bottom: 12px;
+                }
+
+                .claude-quick-btn {
+                    padding: 6px 12px;
+                    background: #f0f0f0;
+                    border: none;
+                    border-radius: 16px;
+                    font-size: 12px;
+                    cursor: pointer;
+                    transition: all 0.2s;
+                }
+
+                .claude-quick-btn:hover {
+                    background: #667eea;
+                    color: white;
+                }
+
+                #claude-floating-response {
+                    padding: 12px;
+                    background: #f8f9fa;
+                    border-radius: 8px;
+                    font-size: 14px;
+                    line-height: 1.5;
+                    white-space: pre-wrap;
+                    max-height: 300px;
+                    overflow-y: auto;
+                }
+
+                #claude-close-btn {
+                    background: rgba(255,255,255,0.2);
+                    border: none;
+                    color: white;
+                    width: 24px;
+                    height: 24px;
+                    border-radius: 50%;
+                    cursor: pointer;
+                    display: flex;
+                    align-items: center;
+                    justify-content: center;
+                }
+
+                #claude-close-btn:hover {
+                    background: rgba(255,255,255,0.3);
+                }
+
+                .claude-loading {
+                    display: flex;
+                    gap: 4px;
+                    padding: 12px;
+                }
+
+                .claude-loading span {
+                    width: 8px;
+                    height: 8px;
+                    background: #667eea;
+                    border-radius: 50%;
+                    animation: bounce 1.4s infinite ease-in-out both;
+                }
+
+                .claude-loading span:nth-child(1) { animation-delay: -0.32s; }
+                .claude-loading span:nth-child(2) { animation-delay: -0.16s; }
+                .claude-loading span:nth-child(3) { animation-delay: 0; }
+
+                @keyframes bounce {
+                    0%, 80%, 100% { transform: scale(0); }
+                    40% { transform: scale(1); }
+                }
+            </style>
+            <div id="claude-floating-header">
+                <span>🤖 Claude AI Assistant</span>
+                <button id="claude-close-btn">✕</button>
+            </div>
+            <div id="claude-floating-content">
+                <textarea id="claude-floating-input" placeholder="Chiedi qualcosa su questa pagina...">${selectedText}</textarea>
+                <div class="claude-quick-actions">
+                    <button class="claude-quick-btn" data-action="explain">💡 Spiega</button>
+                    <button class="claude-quick-btn" data-action="summarize">📝 Riassumi</button>
+                    <button class="claude-quick-btn" data-action="translate">🌐 Traduci</button>
+                    <button class="claude-quick-btn" data-action="improve">✨ Migliora</button>
+                </div>
+                <div id="claude-floating-response"></div>
+            </div>
+        `;
+
+        document.body.appendChild(floatingAssistant);
+
+        // Make draggable
+        makeDraggable(floatingAssistant);
+
+        // Setup events
+        document.getElementById('claude-close-btn').addEventListener('click', () => {
+            floatingAssistant.remove();
+            floatingAssistant = null;
+        });
+
+        document.querySelectorAll('.claude-quick-btn').forEach(btn => {
+            btn.addEventListener('click', (e) => {
+                const action = e.target.dataset.action;
+                const input = document.getElementById('claude-floating-input');
+                handleQuickAction(action, input.value || selectedText);
+            });
+        });
+
+        // Focus input
+        document.getElementById('claude-floating-input').focus();
+    }
+
+    function makeDraggable(element) {
+        let pos1 = 0, pos2 = 0, pos3 = 0, pos4 = 0;
+        const header = document.getElementById('claude-floating-header');
+        
+        header.onmousedown = dragMouseDown;
+
+        function dragMouseDown(e) {
+            e = e || window.event;
+            e.preventDefault();
+            pos3 = e.clientX;
+            pos4 = e.clientY;
+            document.onmouseup = closeDragElement;
+            document.onmousemove = elementDrag;
+        }
+
+        function elementDrag(e) {
+            e = e || window.event;
+            e.preventDefault();
+            pos1 = pos3 - e.clientX;
+            pos2 = pos4 - e.clientY;
+            pos3 = e.clientX;
+            pos4 = e.clientY;
+            element.style.top = (element.offsetTop - pos2) + "px";
+            element.style.left = (element.offsetLeft - pos1) + "px";
+            element.style.bottom = 'auto';
+            element.style.right = 'auto';
+        }
+
+        function closeDragElement() {
+            document.onmouseup = null;
+            document.onmousemove = null;
+        }
+    }
+
+    function handleQuickAction(action, text) {
+        const responseDiv = document.getElementById('claude-floating-response');
+        responseDiv.innerHTML = '<div class="claude-loading"><span></span><span></span><span></span></div>';
+        
+        // Send message to background script
+        chrome.runtime.sendMessage({
+            action: 'askClaude',
+            prompt: `${action}: ${text}`,
+            context: {
+                url: window.location.href,
+                title: document.title
+            }
+        }, (response) => {
+            if (response.error) {
+                responseDiv.textContent = `❌ Errore: ${response.error}`;
+            } else {
+                responseDiv.textContent = response.result;
+            }
+        });
+    }
+
+    function highlightTextOnPage(text) {
+        if (!text) return;
+        
+        const walker = document.createTreeWalker(
+            document.body,
+            NodeFilter.SHOW_TEXT,
+            null,
+            false
+        );
+
+        let node;
+        while (node = walker.nextNode()) {
+            if (node.nodeValue.toLowerCase().includes(text.toLowerCase())) {
+                const span = document.createElement('span');
+                span.style.backgroundColor = 'yellow';
+                span.style.padding = '2px';
+                span.textContent = node.nodeValue;
+                node.parentNode.replaceChild(span, node);
+            }
+        }
+    }
+
+    // Context menu on text selection
+    document.addEventListener('mouseup', function(e) {
+        const selectedText = window.getSelection().toString();
+        if (selectedText.length > 0) {
+            // Store selected text
+            chrome.storage.local.set({ lastSelectedText: selectedText });
+        }
+    });
+
+    // Keyboard shortcut listener
+    document.addEventListener('keydown', function(e) {
+        // Alt+C to ask about selection
+        if (e.altKey && e.key === 'c') {
+            const selectedText = window.getSelection().toString();
+            if (selectedText) {
+                showFloatingAssistant(selectedText);
+            }
+        }
+    });
+
+    console.log('Claude AI Assistant content script loaded');
+})();
+
+// ============================================
+// content/content.css - Styles for injected elements
+// ============================================
+const contentStyles = `
+    .claude-highlight {
+        background-color: yellow !important;
+        padding: 2px !important;
+        border-radius: 2px !important;
+    }
+
+    .claude-tooltip {
+        position: absolute;
+        background: #333;
+        color: white;
+        padding: 8px 12px;
+        border-radius: 6px;
+        font-size: 14px;
+        z-index: 999999;
+        pointer-events: none;
+        opacity: 0;
+        transition: opacity 0.3s;
+    }
+
+    .claude-tooltip.show {
+        opacity: 1;
+    }
+`;
+
+// ============================================
+// background/background.js - Service Worker
+// ============================================
+const backgroundScript = `
+// Service Worker for Claude AI Extension
+console.log('Claude AI Extension Service Worker started');
+
+// Handle installation
+chrome.runtime.onInstalled.addListener((details) => {
+    console.log('Extension installed:', details);
+    
+    // Set default settings
+    chrome.storage.local.set({
+        webSearchEnabled: false,
+        defaultModel: 'claude-sonnet-4',
+        firstTime: true,
+        conversations: []
+    });
+    
+    // Create context menu
+    chrome.contextMenus.create({
+        id: 'claude-ask',
+        title: 'Chiedi a Claude: "%s"',
+        contexts: ['selection']
+    });
+    
+    chrome.contextMenus.create({
+        id: 'claude-explain',
+        title: 'Spiega con Claude',
+        contexts: ['selection'],
+        parentId: 'claude-ask'
+    });
+    
+    chrome.contextMenus.create({
+        id: 'claude-translate',
+        title: 'Traduci con Claude',
+        contexts: ['selection'],
+        parentId: 'claude-ask'
+    });
+    
+    chrome.contextMenus.create({
+        id: 'claude-summarize',
+        title: 'Riassumi con Claude',
+        contexts: ['page'],
+    });
+});
+
+// Handle context menu clicks
+chrome.contextMenus.onClicked.addListener((info, tab) => {
+    switch(info.menuItemId) {
+        case 'claude-ask':
+        case 'claude-explain':
+            handleSelection(info.selectionText, tab, 'explain');
+            break;
+        case 'claude-translate':
+            handleSelection(info.selectionText, tab, 'translate');
+            break;
+        case 'claude-summarize':
+            summarizePage(tab);
+            break;
+    }
+});
+
+function handleSelection(text, tab, action) {
+    // Send to content script to show floating assistant
+    chrome.tabs.sendMessage(tab.id, {
+        action: 'showFloatingAssistant',
+        text: text
+    });
+}
+
+function summarizePage(tab) {
+    chrome.tabs.sendMessage(tab.id, {
+        action: 'getPageContent'
+    }, (response) => {
+        if (response) {
+            // Open popup with summary request
+            chrome.action.openPopup();
+        }
+    });
+}
+
+// Handle messages from content scripts and popup
+chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
+    if (request.action === 'askClaude') {
+        // This would need to communicate with popup or use Puter.js directly
+        // For now, return a mock response
+        setTimeout(() => {
+            sendResponse({
+                result: 'Questa è una risposta di esempio da Claude. In produzione, questo chiamerebbe effettivamente l\\'API di Claude tramite Puter.js.'
+            });
+        }, 1000);
+        return true; // Keep channel open for async response
+    }
+});
+
+// Handle keyboard commands
+chrome.commands.onCommand.addListener((command) => {
+    if (command === 'quick_ask') {
+        chrome.tabs.query({active: true, currentWindow: true}, (tabs) => {
+            chrome.tabs.sendMessage(tabs[0].id, {
+                action: 'showFloatingAssistant'
+            });
+        });
+    }
+});
+
+// Handle badge updates
+function updateBadge(text) {
+    chrome.action.setBadgeText({ text: text });
+    chrome.action.setBadgeBackgroundColor({ color: '#667eea' });
+}
+
+// Web request handling for search (if needed)
+chrome.webRequest.onBeforeRequest.addListener(
+    function(details) {
+        // Could intercept and modify requests here if needed
+        return {cancel: false};
+    },
+    {urls: ["<all_urls>"]},
+    ["blocking"]
+);
+`;
+
+// ============================================
+// options/options.html - Settings Page
+// ============================================
+const optionsHTML = `
+<!DOCTYPE html>
+<html lang="it">
+<head>
+    <meta charset="UTF-8">
+    <title>Claude AI Assistant - Impostazioni</title>
+    <style>
+        body {
+            font-family: -apple-system, sans-serif;
+            max-width: 600px;
+            margin: 40px auto;
+            padding: 20px;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+        }
+        
+        .container {
+            background: white;
+            padding: 30px;
+            border-radius: 12px;
+            box-shadow: 0 10px 40px rgba(0,0,0,0.2);
+        }
+        
+        h1 {
+            color: #333;
+            margin-bottom: 30px;
+        }
+        
+        .setting-group {
+            margin-bottom: 25px;
+        }
+        
+        label {
+            display: block;
+            margin-bottom: 8px;
+            font-weight: 600;
+            color: #555;
+        }
+        
+        input, select, textarea {
+            width: 100%;
+            padding: 10px;
+            border: 2px solid #e0e0e0;
+            border-radius: 6px;
+            font-size: 14px;
+        }
+        
+        input:focus, select:focus, textarea:focus {
+            outline: none;
+            border-color: #667eea;
+        }
+        
+        .checkbox-group {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+        
+        input[type="checkbox"] {
+            width: auto;
+        }
+        
+        button {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            border: none;
+            padding: 12px 24px;
+            border-radius: 6px;
+            font-size: 16px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: transform 0.2s;
+        }
+        
+        button:hover {
+            transform: scale(1.05);
+        }
+        
+        .success-message {
+            background: #4ecdc4;
+            color: white;
+            padding: 12px;
+            border-radius: 6px;
+            margin-top: 20px;
+            display: none;
+        }
+        
+        .shortcuts {
+            background: #f8f9fa;
+            padding: 15px;
+            border-radius: 6px;
+            margin-top: 20px;
+        }
+        
+        .shortcut-item {
+            display: flex;
+            justify-content: space-between;
+            padding: 8px 0;
+            border-bottom: 1px solid #e0e0e0;
+        }
+        
+        .shortcut-item:last-child {
+            border-bottom: none;
+        }
+        
+        kbd {
+            background: #333;
+            color: white;
+            padding: 3px 6px;
+            border-radius: 3px;
+            font-family: monospace;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>⚙️ Impostazioni Claude AI Assistant</h1>
+        
+        <div class="setting-group">
+            <label for="defaultModel">Modello Predefinito</label>
+            <select id="defaultModel">
+                <option value="claude-sonnet-4">Claude Sonnet 4 (Veloce)</option>
+                <option value="claude-opus-4">Claude Opus 4 (Potente)</option>
+                <option value="claude-3-7-sonnet">Claude 3.7 Sonnet</option>
+                <option value="claude-3-7-opus">Claude 3.7 Opus</option>
+            </select>
+        </div>
+        
+        <div class="setting-group">
+            <div class="checkbox-group">
+                <input type="checkbox" id="webSearchEnabled">
+                <label for="webSearchEnabled">Abilita Ricerca Web (Sperimentale)</label>
+            </div>
+        </div>
+        
+        <div class="setting-group">
+            <div class="checkbox-group">
+                <input type="checkbox" id="autoSummarize">
+                <label for="autoSummarize">Riassumi automaticamente pagine lunghe</label>
+            </div>
+        </div>
+        
+        <div class="setting-group">
+            <div class="checkbox-group">
+                <input type="checkbox" id="floatingEnabled">
+                <label for="floatingEnabled">Mostra assistente flottante su selezione testo</label>
+            </div>
+        </div>
+        
+        <div class="setting-group">
+            <label for="customPrompt">Prompt Personalizzato (Opzionale)</label>
+            <textarea id="customPrompt" rows="4" placeholder="Inserisci istruzioni personalizzate per Claude..."></textarea>
+        </div>
+        
+        <div class="setting-group">
+            <label for="apiEndpoint">Endpoint API Personalizzato (Opzionale)</label>
+            <input type="text" id="apiEndpoint" placeholder="https://your-proxy.com/api">
+        </div>
+        
+        <button onclick="saveSettings()">Salva Impostazioni</button>
+        
+        <div class="success-message" id="successMessage">
+            ✓ Impostazioni salvate con successo!
+        </div>
+        
+        <div class="shortcuts">
+            <h3>⌨️ Scorciatoie Tastiera</h3>
+            <div class="shortcut-item">
+                <span>Apri Claude AI</span>
+                <kbd>Ctrl+Shift+C</kbd>
+            </div>
+            <div class="shortcut-item">
+                <span>Chiedi su selezione</span>
+                <kbd>Alt+C</kbd>
+            </div>
+            <div class="shortcut-item">
+                <span>Riassumi pagina</span>
+                <kbd>Ctrl+Shift+S</kbd>
+            </div>
+        </div>
+        
+        <div style="margin-top: 30px; text-align: center; color: #888;">
+            <small>Claude AI Assistant v1.0.0 - Powered by Puter.js</small>
+        </div>
+    </div>
+    
+    <script src="options.js"></script>
+</body>
+</html>
+`;
